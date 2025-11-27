@@ -1,259 +1,309 @@
 import networkx as nx
 import random
+import numpy as np
+import matplotlib.pyplot as plt
 from itertools import islice
+import copy
 
-# --- Constants and Configuration ---
-K_PATHS = 5  # Number of shortest paths to consider as candidates
-NUM_SFC_REQUESTS = 10 # Number of SFC requests to simulate
 
-# --- 1. Network and Request Modeling ---
+import matplotlib
+matplotlib.use('Agg') 
 
-def create_sagin_topology():
-    """
-    Creates the physical SAGIN topology based on the paper's simulation setup.
-    The network is represented as a NetworkX graph. Nodes and edges have attributes
-    for total and available resources, and delay.
-    """
-    G = nx.Graph()
+NUM_REQUESTS_RANGE = range(10, 150, 20)  # X-axis: 10 to 140 requests
+K_PATHS = 5
+USER_DELAY_LIMIT = 200
 
-    # Node properties: (cpu_capacity, processing_delay)
-    node_specs = {
-        'HEO': (200, 15),  # High CPU, high delay
-        'MEO_LEO': (150, 8), # Medium CPU, medium delay
-        'Ground': (300, 3)   # Highest CPU, lowest delay
+SERVICE_TYPES = {
+    1: {'resource': 600, 'type': 'Large_HighBW'},
+    2: {'resource': 400, 'type': 'Large_LowDelay'},
+    3: {'resource': 500, 'type': 'Small_HighBW'},
+    4: {'resource': 400, 'type': 'Small_LowDelay'},
+    5: {'resource': 500, 'type': 'HighBW_LowDelay'},
+    6: {'resource': 300, 'type': 'LowBW_LowDelay'}
+}
+
+class SAGIN_Network:
+    def __init__(self):
+        self.substrate = nx.Graph()
+        self.total_bw_capacity = 0
+        self.total_cpu_capacity = 0
+        self.used_bw = 0
+        self.used_cpu = 0
+        self._build_topology()
+
+    def _build_topology(self):
+        node_cpu = 3000
+        link_bw = 2000 
+        
+        # delays (ms)
+        d_ground = 5
+        d_sat = 15
+        d_inter = 10
+
+        # nodes
+        for i in range(1, 9):
+            self.substrate.add_node(f"G{i}", layer="ground", cpu=node_cpu, max_cpu=node_cpu, delay=d_ground)
+            self.substrate.add_node(f"L{i}", layer="air", cpu=node_cpu, max_cpu=node_cpu, delay=d_sat)
+        for i in range(1, 5):
+            self.substrate.add_node(f"H{i}", layer="space", cpu=node_cpu, max_cpu=node_cpu, delay=d_sat)
+
+        # links 
+        for i in range(1, 9):
+            nxt = i + 1 if i < 8 else 1
+            # ground
+            self.substrate.add_edge(f"G{i}", f"G{nxt}", bw=link_bw, max_bw=link_bw, delay=d_ground)
+            # air
+            self.substrate.add_edge(f"L{i}", f"L{nxt}", bw=link_bw, max_bw=link_bw, delay=d_inter)
+            # ground-air
+            self.substrate.add_edge(f"G{i}", f"L{i}", bw=link_bw, max_bw=link_bw, delay=d_inter)
+            
+        # connections
+        for i in range(1, 9):
+            h_node = f"H{((i-1)//2)+1}"
+            self.substrate.add_edge(f"L{i}", h_node, bw=link_bw, max_bw=link_bw, delay=d_inter)
+
+        # percentage metrics
+        self.total_cpu_capacity = sum(d['max_cpu'] for n, d in self.substrate.nodes(data=True))
+        self.total_bw_capacity = sum(d['max_bw'] for u, v, d in self.substrate.edges(data=True))
+
+    def calculate_path_delay(self, path):
+        delay = 0
+        # node processing delay
+        for node in path:
+            delay += self.substrate.nodes[node]['delay']
+        # link transmission delay
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            delay += self.substrate[u][v]['delay']
+        return delay
+
+    def check_resources(self, path, bw_demand, cpu_demand):
+        # check nodes
+        for node in path:
+            if self.substrate.nodes[node]['cpu'] < cpu_demand:
+                return False
+        # check links
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            if self.substrate[u][v]['bw'] < bw_demand:
+                return False
+        return True
+
+    def consume_resources(self, path, bw_demand, cpu_demand):
+        # deduct CPU
+        for node in path:
+            self.substrate.nodes[node]['cpu'] -= cpu_demand
+            self.used_cpu += cpu_demand
+        # deduct BW
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            self.substrate[u][v]['bw'] -= bw_demand
+            self.used_bw += bw_demand
+
+    # --- ALGORITHM 1: Proposed (Time Delay Mapping) ---
+    def map_proposed(self, req, q_index):
+        # K-Shortest Paths based on Delay
+        try:
+            candidates = list(islice(nx.shortest_simple_paths(self.substrate, req['source'], req['dest'], weight='delay'), K_PATHS))
+        except nx.NetworkXNoPath:
+            return False, 0
+
+        best_path = None
+        min_delay = float('inf')
+        threshold = 0.5 
+
+        for path in candidates:
+            # 1. prediction filter 
+            if random.random() < 0.2: # 20% chance a path is predicted "unstable"
+                continue
+                
+            # 2. resource check
+            if self.check_resources(path, req['bw'], req['service']['resource']):
+                d = self.calculate_path_delay(path)
+                if d < min_delay:
+                    min_delay = d
+                    best_path = path
+
+        if best_path and min_delay <= req['user_delay']:
+            self.consume_resources(best_path, req['bw'], req['service']['resource'])
+            return True, min_delay
+        return False, 0
+
+    # --- ALGORITHM 2: SPO (Shortest Path Optimization) ---
+    def map_spo(self, req):
+        # strictly minimizes delay using dijkstra
+        try:
+            path = nx.shortest_path(self.substrate, req['source'], req['dest'], weight='delay')
+            d = self.calculate_path_delay(path)
+            
+            if d <= req['user_delay'] and self.check_resources(path, req['bw'], req['service']['resource']):
+                self.consume_resources(path, req['bw'], req['service']['resource'])
+                return True, d
+        except nx.NetworkXNoPath:
+            pass
+        return False, 0
+
+    # --- ALGORITHM 3: CLF (Cross-Layer Fusion / Load Balance) ---
+    def map_clf(self, req):
+        # heuristic: Favor paths with higher available bandwidth (load balancing)
+        # custom weight: 1 / (available_bw + epsilon)
+        def lb_weight(u, v, d):
+            return 1000 / (d['bw'] + 1)
+
+        try:
+            path = nx.shortest_path(self.substrate, req['source'], req['dest'], weight=lb_weight)
+            d = self.calculate_path_delay(path)
+            
+            if d <= req['user_delay'] and self.check_resources(path, req['bw'], req['service']['resource']):
+                self.consume_resources(path, req['bw'], req['service']['resource'])
+                return True, d
+        except nx.NetworkXNoPath:
+            pass
+        return False, 0
+
+    # --- ALGORITHM 4: DMRT-SL (Deep Multi-Agent - Proxy) ---
+    def map_dmrt(self, req):
+        # Proxy: Min-Hop (Unweighted Shortest Path)
+        # This often ignores delay nuances and congestion until it hits a wall,
+        # mimicking the "high resource consumption" described in the paper.
+        try:
+            path = nx.shortest_path(self.substrate, req['source'], req['dest']) # No weight = Min Hops
+            d = self.calculate_path_delay(path)
+            
+            if d <= req['user_delay'] and self.check_resources(path, req['bw'], req['service']['resource']):
+                self.consume_resources(path, req['bw'], req['service']['resource'])
+                return True, d
+        except nx.NetworkXNoPath:
+            pass
+        return False, 0
+
+
+# --- SIMULATION ENGINE ---
+
+def generate_requests(num):
+    reqs = []
+    for _ in range(num):
+        s_id = random.randint(1, 6)
+        reqs.append({
+            'source': f"G{random.randint(1, 8)}",
+            'dest': f"G{random.randint(1, 8)}",
+            'bw': random.uniform(10, 100),
+            'user_delay': USER_DELAY_LIMIT,
+            'service': SERVICE_TYPES[s_id]
+        })
+        # ensure src != dest
+        while reqs[-1]['source'] == reqs[-1]['dest']:
+            reqs[-1]['dest'] = f"G{random.randint(1, 8)}"
+    return reqs
+
+def run_comparison():
+    # metrics storage
+    data = {
+        'Proposed': {'acc': [], 'delay': [], 'cpu': [], 'link': []},
+        'SPO': {'acc': [], 'delay': [], 'cpu': [], 'link': []},
+        'CLF': {'acc': [], 'delay': [], 'cpu': [], 'link': []},
+        'DMRT': {'acc': [], 'delay': [], 'cpu': [], 'link': []}
     }
+    
+    x_axis = list(NUM_REQUESTS_RANGE)
 
-    # Add nodes to the graph
-    # 4 HEO satellite nodes
-    for i in range(4):
-        node_id = f"HEO_{i}"
-        G.add_node(node_id, type='HEO',
-                   total_cpu=node_specs['HEO'][0],
-                   available_cpu=node_specs['HEO'][0],
-                   processing_delay=node_specs['HEO'][1])
+    for n_req in x_axis:
+        print(f"Simulating Batch: {n_req} Requests...")
+        batch_reqs = generate_requests(n_req)
+        
+        # instantiate 4 identical networks for fairness
+        nets = {
+            'Proposed': SAGIN_Network(),
+            'SPO': SAGIN_Network(),
+            'CLF': SAGIN_Network(),
+            'DMRT': SAGIN_Network()
+        }
 
-    # 8 MEO/LEO satellite nodes
-    for i in range(8):
-        node_id = f"MEO_LEO_{i}"
-        G.add_node(node_id, type='MEO_LEO',
-                   total_cpu=node_specs['MEO_LEO'][0],
-                   available_cpu=node_specs['MEO_LEO'][0],
-                   processing_delay=node_specs['MEO_LEO'][1])
+        # run algorithms
+        results_cache = {'Proposed': [], 'SPO': [], 'CLF': [], 'DMRT': []}
+        
+        for i, req in enumerate(batch_reqs):
+            # 1. Proposed
+            res = nets['Proposed'].map_proposed(req, i+1)
+            results_cache['Proposed'].append(res)
+            
+            # 2. SPO
+            res = nets['SPO'].map_spo(req)
+            results_cache['SPO'].append(res)
+            
+            # 3. CLF
+            res = nets['CLF'].map_clf(req)
+            results_cache['CLF'].append(res)
+            
+            # 4. DMRT
+            res = nets['DMRT'].map_dmrt(req)
+            results_cache['DMRT'].append(res)
 
-    # 8 Ground gateway nodes
-    for i in range(8):
-        node_id = f"Ground_{i}"
-        G.add_node(node_id, type='Ground',
-                   total_cpu=node_specs['Ground'][0],
-                   available_cpu=node_specs['Ground'][0],
-                   processing_delay=node_specs['Ground'][1])
+        # calculate metrics for this batch
+        for alg_name in data.keys():
+            res_list = results_cache[alg_name]
+            accepted = sum(1 for r in res_list if r[0])
+            delays = [r[1] for r in res_list if r[0]]
+            avg_delay = sum(delays)/len(delays) if delays else 0
+            
+            net = nets[alg_name]
+            link_util = (net.used_bw / net.total_bw_capacity) * 100
+            cpu_util = (net.used_cpu / net.total_cpu_capacity) * 100
+            acc_rate = accepted / n_req
 
-    # Add edges with attributes: (bandwidth, transmission_delay)
-    # This is a simplified connection topology for demonstration
-    # Inter-satellite links (ISLs)
-    for i in range(4):
-        G.add_edge(f"HEO_{i}", f"MEO_LEO_{i}", total_bw=1000, available_bw=1000, delay=20)
-        G.add_edge(f"HEO_{i}", f"MEO_LEO_{i+4}", total_bw=1000, available_bw=1000, delay=20)
+            data[alg_name]['acc'].append(acc_rate)
+            data[alg_name]['delay'].append(avg_delay)
+            data[alg_name]['link'].append(link_util)
+            data[alg_name]['cpu'].append(cpu_util)
 
-    # Satellite-ground links
-    for i in range(8):
-        G.add_edge(f"MEO_LEO_{i}", f"Ground_{i}", total_bw=2000, available_bw=2000, delay=5)
+    return x_axis, data
 
-    # Ground links
-    for i in range(7):
-        G.add_edge(f"Ground_{i}", f"Ground_{i+1}", total_bw=5000, available_bw=5000, delay=1)
+def plot_all(x, data):
+    # setup styles
+    styles = {'Proposed': 'b-o', 'SPO': 'r-s', 'CLF': 'g-^', 'DMRT': 'c-d'}
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # 1. CPU utilization
+    ax = axes[0, 0]
+    for alg, style in styles.items():
+        ax.plot(x, data[alg]['cpu'], style, label=alg)
+    ax.set_title('CPU Resource Utilization')
+    ax.set_ylabel('Utilization (%)')
+    ax.grid(True)
+    ax.legend()
 
-    print("SAGIN topology created successfully.")
-    print(f"Total nodes: {G.number_of_nodes()}, Total edges: {G.number_of_edges()}\n")
-    return G
+    # 2. link utilization
+    ax = axes[0, 1]
+    for alg, style in styles.items():
+        ax.plot(x, data[alg]['link'], style, label=alg)
+    ax.set_title('Link Resource Utilization')
+    ax.set_ylabel('Utilization (%)')
+    ax.grid(True)
+    ax.legend()
 
-def generate_sfc_request(graph_nodes):
-    """
-    Generates a random SFC request based on the paper's model Q = {N, L, V, B, D}.
-    """
-    vnf_sequence = ['VNF1', 'VNF2', 'VNF3']
-    cpu_demand = {vnf: random.randint(10, 30) for vnf in vnf_sequence}
-    bw_demand = random.randint(50, 200)
-    max_delay = random.randint(50, 150) # User-specified max delay (UDq)
+    # 3. deployment delay
+    ax = axes[1, 0]
+    for alg, style in styles.items():
+        ax.plot(x, data[alg]['delay'], style, label=alg)
+    ax.set_title('Avg Deployment Delay')
+    ax.set_ylabel('Delay (ms)')
+    ax.grid(True)
+    ax.legend()
 
-    # Classify the business type based on demands
-    if bw_demand > 150 and max_delay < 100:
-        business_type = "high_bw_low_delay"
-    elif max_delay < 100:
-        business_type = "low_delay"
-    else:
-        business_type = "high_bw"
+    # 4. service acceptance 
+    ax = axes[1, 1]
+    for alg, style in styles.items():
+        ax.plot(x, data[alg]['acc'], style, label=alg)
+    ax.set_title('Service Acceptance Rate')
+    ax.set_ylabel('Rate (0-1)')
+    ax.grid(True)
+    ax.legend()
 
-    return {
-        "source": random.choice(graph_nodes),
-        "target": random.choice(list(set(graph_nodes) - {random.choice(graph_nodes)})),
-        "vnf_sequence": vnf_sequence,
-        "cpu_demand": cpu_demand,
-        "bw_demand": bw_demand,
-        "max_delay": max_delay,
-        "business_type": business_type
-    }
-
-# --- 2. Core Algorithm Implementation (Algorithm 1) ---
-
-def sfc_mapping_algorithm(graph, sfc_request):
-    """
-    Implements Algorithm 1: Service Function Chain Mapping Method Based on Delay Sensitivity.
-
-    Args:
-        graph (nx.Graph): The current state of the physical network.
-        sfc_request (dict): The service request to be mapped.
-
-    Returns:
-        tuple: A tuple containing the result (bool), the chosen path (list), and its delay (float).
-    """
-    print("-" * 50)
-    print(f"Processing SFC Request from {sfc_request['source']} to {sfc_request['target']}")
-    print(f"  - Type: {sfc_request['business_type']}, Max Delay: {sfc_request['max_delay']}ms")
-    print(f"  - Demands: BW={sfc_request['bw_demand']} Mbps, CPU per VNF={sfc_request['cpu_demand'].values()}")
-
-    # Line 1: Initialization is handled by starting with empty candidates
-    source, target = sfc_request['source'], sfc_request['target']
-    vnf_sequence = sfc_request['vnf_sequence']
-    num_vnfs = len(vnf_sequence)
-
-    # Line 2: Service Classification (already done during request generation)
-    # In a real system, this would influence which sub-network to search.
-    # For this simulation, we search the whole graph but prioritize based on type.
-
-    # Line 4: Use KSP algorithm to select the first k shortest paths
-    # We use hop count (unweighted) as the initial metric for "shortest"
-    try:
-        path_generator = nx.shortest_simple_paths(graph, source, target)
-        candidate_paths = list(islice(path_generator, K_PATHS))
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        print("  -> Result: REJECTED. No path exists between source and target.")
-        return False, None, float('inf')
-
-    if not candidate_paths:
-        print("  -> Result: REJECTED. No candidate paths found.")
-        return False, None, float('inf')
-
-    print(f"\n  Found {len(candidate_paths)} candidate paths using KSP...")
-
-    evaluated_paths = [] 
-
-    # Lines 5-12: Path Evaluation Loop
-    for i, path in enumerate(candidate_paths):
-        print(f"  Evaluating Path {i+1}: {path}")
-
-        # A path must have enough nodes to host the source, target, and all VNFs
-        if len(path) < num_vnfs:
-            print("    - Status: Infeasible (not enough nodes for all VNFs).")
-            continue
-
-        # Line 6: Feasibility Check (Resource Availability)
-        is_feasible = True
-        # Check link resources
-        for u, v in zip(path[:-1], path[1:]):
-            if graph.edges[u, v]['available_bw'] < sfc_request['bw_demand']:
-                is_feasible = False
-                print(f"    - Status: Infeasible (Link ({u},{v}) lacks bandwidth).")
-                break
-        if not is_feasible:
-            continue
-
-        # Check node resources (assuming VNFs are placed on intermediate nodes)
-        # Simple placement: place one VNF on each intermediate node.
-        nodes_for_vnfs = path[1:-1]
-        for j, vnf in enumerate(vnf_sequence):
-            if j < len(nodes_for_vnfs):
-                node = nodes_for_vnfs[j]
-                if graph.nodes[node]['available_cpu'] < sfc_request['cpu_demand'][vnf]:
-                    is_feasible = False
-                    print(f"    - Status: Infeasible (Node {node} lacks CPU for {vnf}).")
-                    break
-        if not is_feasible:
-            continue
-
-        print("    - Status: Feasible (Resources are available).")
-
-        # Line 7 & 11: Calculate Total Delay (TD_k)
-        total_delay = 0
-        # Link transmission delay
-        for u, v in zip(path[:-1], path[1:]):
-            total_delay += graph.edges[u, v]['delay']
-        # Node processing delay
-        for j, vnf in enumerate(vnf_sequence):
-             if j < len(nodes_for_vnfs):
-                node = nodes_for_vnfs[j]
-                total_delay += graph.nodes[node]['processing_delay']
-
-        print(f"    - Predicted Delay: {total_delay:.2f}ms")
-        evaluated_paths.append({'path': path, 'delay': total_delay})
-
-    # Line 13: Select the path with the least total delay
-    if not evaluated_paths:
-        print("\n  -> Result: REJECTED. No feasible paths found among candidates.")
-        return False, None, float('inf')
-
-    best_path_info = min(evaluated_paths, key=lambda x: x['delay'])
-    best_path = best_path_info['path']
-    min_delay = best_path_info['delay']
-
-    print(f"\n  Best feasible path found: {best_path} with delay {min_delay:.2f}ms")
-
-    # Lines 14-19: Final QoS Check and Deployment
-    if min_delay <= sfc_request['max_delay']:
-        print(f"  -> Result: ACCEPTED. Predicted delay ({min_delay:.2f}ms) is within user limit ({sfc_request['max_delay']}ms).")
-
-        # Line 15: Instantiate SFC and update node and link load
-        # Update link resources
-        for u, v in zip(best_path[:-1], best_path[1:]):
-            graph.edges[u, v]['available_bw'] -= sfc_request['bw_demand']
-        # Update node resources
-        nodes_for_vnfs = best_path[1:-1]
-        for j, vnf in enumerate(vnf_sequence):
-            if j < len(nodes_for_vnfs):
-                node = nodes_for_vnfs[j]
-                graph.nodes[node]['available_cpu'] -= sfc_request['cpu_demand'][vnf]
-
-        print("  Network resources updated.")
-        return True, best_path, min_delay
-    else:
-        print(f"  -> Result: REJECTED. Minimum delay ({min_delay:.2f}ms) exceeds user limit ({sfc_request['max_delay']}ms).")
-        return False, best_path, min_delay
-
-# --- 3. Simulation Execution ---
-
-def main():
-    """
-    Main function to run the simulation.
-    """
-    print("=== Starting SAGIN SFC Mapping Simulation ===")
-    sagin_graph = create_sagin_topology()
-    all_nodes = list(sagin_graph.nodes())
-
-    accepted_count = 0
-    rejected_count = 0
-
-    for i in range(NUM_SFC_REQUESTS):
-        print(f"\n--- Request #{i+1}/{NUM_SFC_REQUESTS} ---")
-        request = generate_sfc_request(all_nodes)
-
-        # Ensure source and target are different
-        while request['source'] == request['target']:
-            request['target'] = random.choice(all_nodes)
-
-        is_accepted, _, _ = sfc_mapping_algorithm(sagin_graph, request)
-
-        if is_accepted:
-            accepted_count += 1
-        else:
-            rejected_count += 1
-
-    print("\n" + "="*50)
-    print("=== Simulation Finished ===")
-    print(f"Total Requests: {NUM_SFC_REQUESTS}")
-    print(f"Accepted: {accepted_count} ({accepted_count/NUM_SFC_REQUESTS:.2%})")
-    print(f"Rejected: {rejected_count} ({rejected_count/NUM_SFC_REQUESTS:.2%})")
-    print("="*50)
-
+    plt.tight_layout()
+    plt.savefig('sagin_comparison_results.png')
+    print("Graphs saved to 'sagin_comparison_results.png'")
 
 if __name__ == "__main__":
-    main()
+    x, res = run_comparison()
+    plot_all(x, res)
