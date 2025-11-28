@@ -242,7 +242,7 @@ def run_comparison():
 
         for i, req in enumerate(batch_reqs):
             results['Proposed'].append(nets['Proposed'].map_proposed(req, i+1))
-            results['Improved'].append(nets['Improved'].map_improved_energy(req, i+1))
+            results['Improved'].append(nets['Improved'].map_improved_energy(req))
             results['SPO'].append(nets['SPO'].map_spo(req))
             results['CLF'].append(nets['CLF'].map_clf(req))
             results['DMRT'].append(nets['DMRT'].map_dmrt(req))
