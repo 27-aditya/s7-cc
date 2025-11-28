@@ -1,12 +1,11 @@
 import networkx as nx
 import random
-import numpy as np
 import matplotlib
 
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 from itertools import islice
-import copy
+
 
 # --- CONFIGURATION ---
 NUM_REQUESTS_RANGE = range(10, 150, 20)  # X-axis: 10 to 140 requests
@@ -136,7 +135,7 @@ class SAGIN_Network:
         return False, 0
 
     # --- 2. IMPROVEMENT (Energy-Aware) ---
-    def map_improved_energy(self, req, q_index):
+    def map_improved_energy(self, req):
         """
         IMPROVED ALGORITHM:
         Minimizes Cost = Delay + (alpha * Energy).
