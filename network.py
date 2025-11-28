@@ -1,10 +1,7 @@
 import networkx as nx
 import random
-import numpy as np
 import matplotlib.pyplot as plt
 from itertools import islice
-import copy
-
 
 import matplotlib
 matplotlib.use('Agg') 
@@ -101,7 +98,7 @@ class SAGIN_Network:
             self.used_bw += bw_demand
 
     # --- ALGORITHM 1: Proposed (Time Delay Mapping) ---
-    def map_proposed(self, req, q_index):
+    def map_proposed(self, req):
         # K-Shortest Paths based on Delay
         try:
             candidates = list(islice(nx.shortest_simple_paths(self.substrate, req['source'], req['dest'], weight='delay'), K_PATHS))
@@ -163,8 +160,7 @@ class SAGIN_Network:
 
     # --- ALGORITHM 4: DMRT-SL (Deep Multi-Agent - Proxy) ---
     def map_dmrt(self, req):
-        # Proxy: Min-Hop (Unweighted Shortest Path)
-        # This often ignores delay nuances and congestion until it hits a wall,
+        # proxy : min-hop path selection
         # mimicking the "high resource consumption" described in the paper.
         try:
             path = nx.shortest_path(self.substrate, req['source'], req['dest']) # No weight = Min Hops
